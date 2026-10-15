@@ -164,14 +164,17 @@ class TriggerGuards(unittest.TestCase):
 
     def test_atomic_reservation_blocks_duplicate_model_calls(self):
         gh = Mock(repository='team/repo')
-        gh.api.side_effect = [pull(), pull(), fix.Stop('API request failed with HTTP 422.')]
+        gh.api.side_effect = [pull(), pull(), fix.Stop('API request failed with HTTP 422.'),
+                              {'object': {'sha': HEAD}}]
         gh.pages.side_effect = [[], [{'filename': FILE, 'status': 'modified'}]]
         data = {'pr_number': 7, 'head_sha': HEAD,
                 'review': {'review': {'key_issues_to_review': [{'issue': 'bad input'}]}}}
         with patch.object(fix, 'manual_handoff', return_value=data), \
-             patch.object(fix, 'file_at', return_value=SOURCE), patch.object(fix, 'request_json') as model:
+             patch.object(fix, 'file_at', return_value=SOURCE), patch.object(fix, 'request_json') as model, \
+             patch.dict(os.environ, {'LLM_API_KEY': 'fake-not-sent'}):
             with self.assertRaises(fix.Stop): fix.generate(gh)
             model.assert_not_called()
+        self.assertEqual(gh.api.call_count, 4)
 
     def test_handoff_rejects_wrong_workflow_without_downloading_artifacts(self):
         gh = Mock(repository='team/repo')
@@ -185,12 +188,35 @@ class TriggerGuards(unittest.TestCase):
         run = {'path': '.github/workflows/shizhen-review.yml', 'name': 'shizhen-review',
                'conclusion': 'success', 'event': 'pull_request_target',
                'repository': {'full_name': 'team/repo'}}
-        gh.api.side_effect = [run, {'artifacts': [{'id': 1, 'name': 'shizhen-review-handoff'}]}]
+        gh.api.side_effect = [run, {'artifacts': [{'id': 1, 'name': 'shizhen-review-handoff-1'}]}]
         archive = io.BytesIO()
         with zipfile.ZipFile(archive, 'w') as stream:
-            stream.writestr('handoff.json', json.dumps({'repository': 'team/repo', 'run_id': 999}))
+            stream.writestr('handoff.json', json.dumps({'repository': 'team/repo', 'run_id': 999,
+                                                      'run_attempt': 1}))
         with patch.object(fix, 'open_request', return_value=io.BytesIO(archive.getvalue())):
             with self.assertRaises(fix.Stop): fix.handoff_from_run(gh, 123)
+
+    def test_run_without_eligible_author_handoff_is_a_clean_skip(self):
+        gh = Mock(repository='team/repo')
+        gh.api.side_effect = [
+            {'path': '.github/workflows/shizhen-review.yml', 'name': 'shizhen-review',
+             'conclusion': 'success', 'event': 'pull_request_target',
+             'repository': {'full_name': 'team/repo'}, 'run_attempt': 1},
+            {'artifacts': []},
+        ]
+        with self.assertRaisesRegex(fix.Stop, '^Skipped:'):
+            fix.handoff_from_run(gh, 123)
+
+    def test_no_findings_reserves_no_branch_and_spends_no_model_call(self):
+        gh = Mock(repository='team/repo'); gh.api.return_value = pull()
+        gh.pages.return_value = []
+        review = {'pr_number': 7, 'head_sha': HEAD,
+                  'review': {'review': {'key_issues_to_review': []}}}
+        with patch.object(fix, 'manual_handoff', return_value=review), \
+             patch.object(fix, 'request_json') as model:
+            with self.assertRaisesRegex(fix.Stop, '^No actionable'): fix.generate(gh)
+            model.assert_not_called()
+        self.assertEqual(gh.api.call_count, 2)
 
     def test_materialization_rejects_symlinks_and_traversal(self):
         for malicious in ['symlink', 'traversal']:

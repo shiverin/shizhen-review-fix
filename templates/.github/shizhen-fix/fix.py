@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-import sys
 import tarfile
 import urllib.error
 import urllib.parse
@@ -26,7 +25,6 @@ MODEL = 'x-test-1'
 ENDPOINT = 'https://soclaas-api.comp.nus.edu.sg/v1/chat/completions'
 SHA = re.compile(r'[0-9a-f]{40}')
 MAX_FILE_BYTES = 60_000
-MAX_CONTEXT_BYTES = 150_000
 MAX_PROPOSAL_BYTES = 500_000
 
 
@@ -206,10 +204,13 @@ def handoff_from_run(gh, run_id):
             or run.get('repository', {}).get('full_name') != gh.repository):
         raise Stop('The source run is not a successful trusted shizhen-review run.')
     artifacts = gh.api(f'actions/runs/{run_id}/artifacts')['artifacts']
-    matches = [item for item in artifacts if item['name'] == 'shizhen-review-handoff'
+    attempt = run.get('run_attempt', 1)
+    matches = [item for item in artifacts if item['name'] == f'shizhen-review-handoff-{attempt}'
                and not item.get('expired')]
+    if not matches:
+        raise Stop('Skipped: no eligible review handoff in this run.')
     if len(matches) != 1:
-        raise Stop('Missing or ambiguous review handoff artifact.')
+        raise Stop('Ambiguous review handoff artifact.')
     request = urllib.request.Request(
         gh.prefix + f'actions/artifacts/{matches[0]["id"]}/zip',
         headers={'Authorization': f'Bearer {gh.token}', 'User-Agent': 'shizhen-fix'})
@@ -224,7 +225,8 @@ def handoff_from_run(gh, run_id):
         if entries[0].file_size > MAX_PROPOSAL_BYTES:
             raise Stop('Review artifact expands beyond the size limit.')
         data = json.loads(archive.read(entries[0]))
-    if data.get('repository') != gh.repository or data.get('run_id') != run_id:
+    if (data.get('repository') != gh.repository or data.get('run_id') != run_id
+            or data.get('run_attempt') != attempt):
         raise Stop('Review artifact provenance mismatch.')
     return data
 
@@ -275,22 +277,27 @@ def generate(gh):
     if (len(files) > SETTINGS['max_files']
             or sum(len(text.encode()) for text in files.values()) > SETTINGS['max_source_chars']):
         raise Stop('PR exceeds the bounded context limit; human fixes required.')
+    token = os.environ.get('LLM_API_KEY', '')
+    if not token:
+        raise Stop('Missing SoCLaaS repository secret LLM_API_KEY.')
     # An atomic ref reservation makes repeated runs, no-fix results and failures idempotent.
     branch = f'shizhen-fix/pr-{number}-{sha[:12]}'
     try:
         gh.api('git/refs', {'ref': 'refs/heads/' + branch, 'sha': sha})
     except Stop as error:
         if 'HTTP 422' in str(error):
-            raise Stop('Skipped: this PR commit already has a reserved fix attempt.') from None
+            # A 422 can also mean an invalid commit. Verify the branch actually exists.
+            existing = gh.api('git/ref/heads/' + urllib.parse.quote(branch, safe='/'))
+            if existing.get('object', {}).get('sha'):
+                raise Stop('Skipped: this PR commit already has a reserved fix attempt.') from None
         raise
-    token = os.environ.get('LLM_API_KEY', '')
-    if not token:
-        raise Stop('Missing SoCLaaS repository secret LLM_API_KEY.')
     instructions = (ROOT / 'instructions.md').read_text()
     standards = ROOT.parent / 'shizhen-review' / 'course-standards.md'
     instructions += '\n\n' + standards.read_text()
     context = json.dumps({'findings': findings, 'files': files,
                           'changed_files': [item['filename'] for item in changed]}, ensure_ascii=False)
+    if len((instructions + context).encode()) > 65_000:
+        raise Stop('Combined review context exceeds the initial rollout budget.')
     response = request_json(ENDPOINT, token, {
         'model': MODEL, 'reasoning_effort': 'high', 'max_completion_tokens': 8192,
         'messages': [{'role': 'system', 'content': instructions},
@@ -445,7 +452,8 @@ def handoff(gh):
         return
     save('review-head.json', {'repository': gh.repository, 'pr_number': number,
                               'head_sha': pr['head']['sha'],
-                              'run_id': int(os.environ['GITHUB_RUN_ID'])})
+                              'run_id': int(os.environ['GITHUB_RUN_ID']),
+                              'run_attempt': int(os.environ.get('GITHUB_RUN_ATTEMPT', '1'))})
 
 
 def finish_handoff(gh):

@@ -2,7 +2,7 @@
 
 The release is an experimental implementation and template, not a verified production deployment.
 
-* All 25 local package unit tests passed on 2026-10-15. They exercise safety and routing behavior with fake GitHub/model responses, including a complete generation-to-materialization fixture. They make no paid model calls and no remote changes.
+* All 27 local package unit tests passed on 2026-10-15. They exercise safety and routing behavior with fake GitHub/model responses, including a complete generation-to-materialization fixture. They make no paid model calls and no remote changes.
 * Actionlint 1.7.12 passed for the template workflows and package validation workflow. It does not execute actions or prove runner/container compatibility. The reusable skill also passed the skill frontmatter validator.
 * Installer tests verify author configuration and refusal to overwrite existing workflow files.
 * The pre-existing reviewer in the original team repository completed a real review using `x-test-1`. That does not prove this new review/fix chain works end to end.

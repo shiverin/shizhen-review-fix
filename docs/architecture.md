@@ -31,7 +31,7 @@ sequenceDiagram
     Author->>GH: Accept repairs or keep original
 ```
 
-The `workflow_run` payload does not reliably identify a fork PR. The reviewer therefore exports a narrow authenticated artifact instead of guessing from comments or branch names. The artifact binds repository, PR number, run ID, reviewed head SHA, and structured findings. Its only archive member must be `handoff.json`. The fixer checks the successful source workflow's path, name, event, repository, and run identity. Artifact sizes and source context are bounded.
+The `workflow_run` payload does not reliably identify a fork PR. The reviewer therefore exports a narrow authenticated artifact instead of guessing from comments or branch names. The artifact binds repository, PR number, run ID, run attempt, reviewed head SHA, and structured findings. Its only archive member must be `handoff.json`. The fixer checks the successful source workflow's path, name, event, repository, run identity, and attempt-specific artifact name. Artifact sizes and source context are bounded.
 
 Author checks happen before model generation, while preparing the candidate, and again before publishing. The reviewer still reviews other authors; it simply produces no eligible fix handoff for them. Numeric identity prevents a matching display name from expanding the rollout.
 

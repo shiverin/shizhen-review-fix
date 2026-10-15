@@ -19,3 +19,4 @@ jobs:
           .github/workflows/validate.yml
           templates/.github/workflows/shizhen-review.yml
           templates/.github/workflows/shizhen-fix.yml
+          templates/.github/workflows/shizhen-fix-tests.yml
