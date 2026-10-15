@@ -1,0 +1,146 @@
+name: shizhen-fix
+
+on:
+  workflow_run:
+    workflows: [shizhen-review]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Your PR number with a successful shizhen-review handoff
+        required: true
+        type: number
+
+permissions: {}
+
+# Serialize this limited rollout. A durable branch reservation also prevents
+# different review runs or manual retries from fixing the same original commit.
+concurrency:
+  group: shizhen-fix
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+    outputs:
+      proposed: ${{ steps.propose.outputs.proposed }}
+    steps:
+      - name: Load trusted automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/shizhen-fix
+            .github/shizhen-review
+
+      - name: Validate author and review; propose fixes with x-test-1
+        id: propose
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: python3 .github/shizhen-fix/fix.py generate
+
+      - name: Save the immutable proposal
+        if: steps.propose.outputs.proposed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: shizhen-fix-proposal
+          path: proposal.json
+          if-no-files-found: error
+          retention-days: 7
+
+  check:
+    needs: propose
+    if: needs.propose.outputs.proposed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Load trusted test launcher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github/shizhen-fix
+
+      - name: Read the proposal from the trusted propose job
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: shizhen-fix-proposal
+
+      - name: Prepare and validate a disposable source snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/shizhen-fix/fix.py materialize
+
+      - name: Set up JDK 25 with JavaFX
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: zulu
+          java-version: '25'
+          java-package: jdk+fx
+
+      - name: Build the trusted test container
+        run: docker build -t shizhen-fix-check .github/shizhen-fix
+
+      # PR build scripts and tests run only inside this disposable container.
+      # It receives neither API keys, GitHub tokens, runner files nor Docker socket.
+      # Network access permits dependency downloads; no shared cache is restored.
+      - name: Run Gradle checks and coverage without credentials
+        run: |
+          set -o pipefail
+          docker run --rm --read-only --cap-drop=ALL \
+            --security-opt=no-new-privileges --pids-limit=512 --memory=6g --cpus=2 \
+            --tmpfs /tmp:rw,exec,nosuid,size=3g \
+            --mount "type=bind,src=$PWD/candidate,dst=/work" \
+            --mount "type=bind,src=$JAVA_HOME,dst=/jdk,readonly" \
+            -e JAVA_HOME=/jdk -e PATH=/jdk/bin:/usr/bin:/bin \
+            -e HOME=/tmp -e GRADLE_USER_HOME=/tmp/gradle \
+            shizhen-fix-check sh -c 'sh ./gradlew --no-daemon check coverage' \
+            2>&1 | tee test.log
+
+      - name: Save test output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: shizhen-fix-test-log
+          path: test.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    needs: [propose, check]
+    if: always() && needs.propose.outputs.proposed == 'true' && needs.check.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Load trusted publisher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github/shizhen-fix
+
+      # Download the original proposal, never files modified by untrusted tests.
+      - name: Read the original proposal from the propose job
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: shizhen-fix-proposal
+
+      - name: Revalidate author and original commit; open a draft fix PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VALIDATION_RESULT: ${{ needs.check.result }}
+        run: python3 .github/shizhen-fix/fix.py publish

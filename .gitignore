@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.*
+!.env.example
+.DS_Store
+proposal.json
+candidate/
+review-data.json
+review-head.json
+review-handoff/
+test.log

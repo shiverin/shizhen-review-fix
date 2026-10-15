@@ -1,0 +1,140 @@
+name: shizhen-review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to review
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: shizhen-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: shizhen-review
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # With pull_request_target, github.sha is trusted base-branch code.
+      # Never check out or execute PR code while the secrets are available.
+      - name: Read trusted review instructions
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/shizhen-review
+            .github/shizhen-fix
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned review engine
+        run: >-
+          pip install
+          'pr-agent[github] @ git+https://github.com/qodo-ai/pr-agent.git@330f0813b5fe0d1f54b794077c2d02aa85a1fb63'
+          google-auth
+
+      - name: Keep review comments independent of the existing reviewer
+        run: python .github/shizhen-review/namespace-engine.py
+
+      - name: Snapshot eligible PR for the optional fix handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: python .github/shizhen-fix/fix.py handoff
+
+      - name: Review changed code with SoCLaaS
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          GITHUB__USER_TOKEN: ${{ github.token }}
+          OPENAI__API_BASE: https://soclaas-api.comp.nus.edu.sg/v1
+          OPENAI__KEY: ${{ secrets.LLM_API_KEY }}
+          CONFIG__MODEL: openai/x-test-1
+          CONFIG__FALLBACK_MODELS: '[]'
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: '32000'
+          CONFIG__MAX_MODEL_TOKENS: '24192'
+          CONFIG__MAX_OUTPUT_TOKENS: '12000'
+          CONFIG__ADDITIONAL_REASONING_EFFORT_MODELS: '["x-test-1"]'
+          CONFIG__NO_TEMPERATURE_MODELS: '["x-test-1"]'
+          CONFIG__REASONING_EFFORT: high
+          CONFIG__AI_TIMEOUT: '280'
+          CONFIG__NUM_RETRIES: '0'
+          CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: 'false'
+          CONFIG__USE_REPO_SETTINGS_FILE: 'false'
+          CONFIG__USE_GLOBAL_SETTINGS_FILE: 'false'
+          CONFIG__REPO_CONTEXT_FILES: '[]'
+          CONFIG__PROPAGATE_TOOL_ERRORS: 'true'
+          CONFIG__PUBLISH_OUTPUT_PROGRESS: 'false'
+          CONFIG__OUTPUT_RUN_DETAILS: 'true'
+          CONFIG__ALLOW_DYNAMIC_CONTEXT: 'false'
+          CONFIG__PATCH_EXTRA_LINES_BEFORE: '10'
+          CONFIG__PATCH_EXTRA_LINES_AFTER: '10'
+          PR_REVIEWER__REVIEW_HEADING: shizhen-review
+          PR_REVIEWER__INLINE_KEY_ISSUES: 'true'
+          PR_REVIEWER__PERSISTENT_COMMENT: 'true'
+          PR_REVIEWER__PERSISTENT_FINDING_STATE: 'false'
+          PR_REVIEWER__ENABLE_LARGE_PR_CHUNKING: 'true'
+          PR_REVIEWER__MAX_NUMBER_OF_CALLS: '8'
+          PR_REVIEWER__NUM_MAX_FINDINGS: '20'
+          PR_REVIEWER__REQUIRE_TESTS_REVIEW: 'true'
+          PR_REVIEWER__REQUIRE_SECURITY_REVIEW: 'true'
+          PR_REVIEWER__REQUIRE_RISK_ASSESSMENT: 'true'
+          PR_REVIEWER__REQUIRE_FAILURE_MODES: 'true'
+          PR_REVIEWER__REQUIRE_PRIORITY_FILES: 'true'
+          PR_REVIEWER__REQUIRE_TICKET_ANALYSIS_REVIEW: 'false'
+          PR_REVIEWER__REQUIRE_ESTIMATE_EFFORT_TO_REVIEW: 'false'
+          PR_REVIEWER__ENABLE_REVIEW_LABELS_SECURITY: 'false'
+          PR_REVIEWER__ENABLE_REVIEW_LABELS_EFFORT: 'false'
+          PR_REVIEWER__ENABLE_REVIEW_COVERAGE_FOOTER: 'true'
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          number = os.environ['PR_NUMBER']
+          if not number.isascii() or not number.isdigit() or int(number) < 1:
+              sys.exit('A positive integer PR number is required.')
+          if not os.environ.get('OPENAI__KEY'):
+              sys.exit('Missing repository secret LLM_API_KEY (SoCLaaS key).')
+          root = Path('.github/shizhen-review')
+          instructions = '\n\n'.join(
+              (root / name).read_text()
+              for name in ('instructions.md', 'course-standards.md')
+          )
+          os.environ['PR_REVIEWER__EXTRA_INSTRUCTIONS'] = instructions
+          url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/pull/{number}"
+          subprocess.run(
+              [sys.executable, '-m', 'pr_agent.cli', f'--pr_url={url}',
+               '--json-output=review-data.json', 'review'],
+              check=True,
+          )
+          PY
+
+      - name: Bind structured findings to the unchanged eligible PR head
+        if: hashFiles('review-head.json') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/shizhen-fix/fix.py finish-handoff
+
+      - name: Publish the eligible review handoff
+        if: hashFiles('review-handoff/handoff.json') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: shizhen-review-handoff
+          path: review-handoff/handoff.json
+          if-no-files-found: error
+          retention-days: 7
